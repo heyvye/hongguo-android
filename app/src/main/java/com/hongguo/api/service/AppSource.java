@@ -197,7 +197,7 @@ public final class AppSource {
             if (!hasPlaybackTime(started, budgetMs)) break;
             if (route.renewsIdentity) {
                 try {
-                    identity = PlaybackDevice.fresh();
+                    identity = PlaybackDevice.renew();
                 } catch (IOException e) {
                     // 换身份失败（冷却或离线）时仍用原身份试完剩余路径。
                     if (Thread.currentThread().isInterrupted()) throw e;
@@ -240,6 +240,8 @@ public final class AppSource {
         }
         // 模型错误比 HTTP/空响应更能说明本集的情况（如仅有 ByteVC2），优先报告。
         if (modelFailure != null) throw modelFailure;
+        // 整次取流失败：丢弃落盘身份，下次播放重新注册一个（避免一直卡在同一身份上）。
+        PlaybackDevice.clearSaved();
         if (failure != null) throw failure;
         EmptyPlaybackResponseException empty = new EmptyPlaybackResponseException();
         if (renewal != null) empty.addSuppressed(renewal);
@@ -261,7 +263,11 @@ public final class AppSource {
         private PlaybackRejectedException(String message, boolean backoff) { super(message); this.backoff = backoff; }
 
         private void forgetRejectedIdentity(PlaybackDevice.Identity identity) {
-            if (!backoff) PLAYBACK_IDENTITY.compareAndSet(identity, null);
+            if (!backoff) {
+                PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                // 被明确拒绝的身份不能再从落盘恢复，否则每次播放都会拿它撞墙。
+                PlaybackDevice.clearSaved();
+            }
         }
     }
 
@@ -283,7 +289,10 @@ public final class AppSource {
         if (error instanceof PlaybackHttpException) {
             int status = ((PlaybackHttpException) error).status;
             if (status == 403 || status == 429) {
-                if (status == 403) PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                if (status == 403) {
+                    PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                    PlaybackDevice.clearSaved();
+                }
                 checkPlaybackRejection(status);
             }
         }
@@ -875,7 +884,8 @@ public final class AppSource {
     private static Stream.VideoTrack fetchPrimary(String vid, String quality, PlaybackDevice.Identity identity) throws Exception {
         checkPlaybackCancellation();
         com.hongguo.api.playback.MobilePlayerV5.Request signed =
-                com.hongguo.api.playback.MobilePlayerV5.request(vid, identity.deviceId, identity.iid, identity.cdid, System.currentTimeMillis());
+                com.hongguo.api.playback.MobilePlayerV5.request(vid, identity.deviceId, identity.iid, identity.cdid,
+                        System.currentTimeMillis(), identity.cookie);
         Http.Req req = new Http.Req(signed.getUrl()).method("POST").timeout(PLAYBACK_TIMEOUT_MS);
         req.followRedirect = false;
         for (Map.Entry<String, String> header : signed.getHeaders().entrySet()) req.header(header.getKey(), header.getValue());

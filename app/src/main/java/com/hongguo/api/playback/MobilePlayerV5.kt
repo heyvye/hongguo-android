@@ -11,7 +11,8 @@ object MobilePlayerV5 {
     private val signer = Signer(mobileV5 = true)
     data class Request(val url: String, val headers: Map<String, String>, val body: ByteArray)
 
-    @JvmStatic fun request(id: String, deviceId: String, iid: String, cdid: String, now: Long): Request {
+    @JvmStatic @JvmOverloads
+    fun request(id: String, deviceId: String, iid: String, cdid: String, now: Long, cookie: String? = null): Request {
         require(listOf(id, deviceId, iid).all { it.matches(Regex("[0-9]{1,30}")) })
         val query = linkedMapOf("aid" to "8662", "app_name" to "novelread", "version_code" to "74332",
             "version_name" to "7.4.3.32", "channel" to "vivo_8662_64", "device_platform" to "android",
@@ -22,9 +23,14 @@ object MobilePlayerV5 {
         GZIPOutputStream(output).use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
         val body = output.toByteArray()
         val signed = signer.signPlayback(ENDPOINT, query, body, now)
-        val headers = signed.headers + mapOf("User-Agent" to
-            "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)",
-            "Accept" to "application/json", "Content-Encoding" to "gzip")
+        val headers = buildMap {
+            putAll(signed.headers)
+            put("User-Agent", "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)")
+            put("Accept", "application/json")
+            put("Content-Encoding", "gzip")
+            // 注册下发的匿名 Cookie；参考实现（skydeadpeng/hongguo-android-cast）的播放请求会带上。
+            if (!cookie.isNullOrEmpty()) put("Cookie", cookie)
+        }
         return Request(signed.url, headers, body)
     }
 }

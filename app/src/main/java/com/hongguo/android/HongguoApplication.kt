@@ -19,5 +19,7 @@ class HongguoApplication : Application() {
         }
         val config = assets.open("upstream.json").bufferedReader().use { it.readText() }
         Config.initialize(config, cacheDir.resolve("media").absolutePath, deviceId)
+        // 播放身份落盘目录：一次注册长期复用，避免反复注册消耗身份信誉。
+        com.hongguo.api.service.PlaybackDevice.setStoreDir(filesDir)
     }
 }
