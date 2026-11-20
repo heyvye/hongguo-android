@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 package com.hongguo.api.service;
 
-import com.hongguo.api.core.PureSign;
 import com.hongguo.api.util.Crypto;
+import com.hongguo.api.util.Diag;
 import com.hongguo.api.util.Http;
 import com.hongguo.api.util.Json;
 import com.hongguo.api.util.Log;
@@ -91,14 +91,6 @@ public final class PlaybackDevice {
     private static final Pattern VALID_ID = Pattern.compile("[0-9]{1,30}");
 
     private static final SecureRandom RND = new SecureRandom();
-
-    /** 目录浏览预热：注册后先用同一身份浏览一次书城，留下真实客户端的浏览足迹。 */
-    private static final String WARMUP_URL =
-            "https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/bookmall/tab/v1/";
-
-    private static final String WARMUP_UA =
-            "com.phoenix.read/74332 (Linux; U; Android 16; zh_CN; 25053RT47C; "
-            + "Build/BP2A.250605.031.A3)";
 
     /** 匿名身份落盘目录；由 Application 设置，为空时只在内存里用（与旧行为一致）。 */
     private static volatile File storeDir;
@@ -232,7 +224,10 @@ public final class PlaybackDevice {
      */
     public static Identity fresh() throws IOException {
         Identity saved = loadSaved();
-        if (saved != null) return saved;
+        if (saved != null) {
+            Diag.log("identity: reusing saved device_id=" + mask(saved.deviceId));
+            return saved;
+        }
         return renew();
     }
 
@@ -241,9 +236,17 @@ public final class PlaybackDevice {
      * 失败在冷却期内直接复用，避免预加载与重试造成注册风暴。
      */
     public static Identity renew() throws IOException {
+        Diag.log("identity: registering a new device");
         Identity identity = registerFresh();
         save(identity);
+        Diag.log("identity: registered device_id=" + mask(identity.deviceId)
+                + " cookie=" + (identity.cookie == null || identity.cookie.isEmpty() ? "none" : "yes"));
         return identity;
+    }
+
+    private static String mask(String value) {
+        if (value == null) return "(null)";
+        return value.length() <= 4 ? "****" : value.substring(0, 4) + "***" + value.substring(value.length() - 2);
     }
 
     /** 注册一个新身份但不落盘（推荐流等独立身份用）。 */
@@ -317,6 +320,7 @@ public final class PlaybackDevice {
         RND.nextBytes(random);
         byte[] body = buildBody(now, cdid, random);
         Reply res = transport.post(REGISTER_URL, headers(body, now), body);
+        Diag.log("device_register -> " + res.status + " bytes=" + (res.text == null ? 0 : res.text.length()));
         if (res.status != 200) throw new IOException("register HTTP " + res.status);
         Map<String, Object> j;
         try {
@@ -325,56 +329,8 @@ public final class PlaybackDevice {
             throw new IOException("register response is not JSON");
         }
         Identity identity = parse(j, cdid, cookieHeader(res.setCookies));
-        warmupAsync(identity);
         return identity;
     }
-
-    /**
-     * 后台预热：注册后立刻用同一身份浏览一次书城，留下真实客户端的浏览足迹。
-     * 参考实现（skydeadpeng/hongguo-android-cast，GPL-3.0）记录：直接请求播放接口、
-     * 没有任何浏览足迹的身份会拿到空正文。预热失败不重试、不阻塞取流。
-     */
-    private static void warmupAsync(final Identity identity) {
-        Thread thread = new Thread(() -> warmup(identity), "hongguo-warmup");
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private static void warmup(Identity identity) {
-        try {
-            long now = System.currentTimeMillis();
-            String query = "iid=" + identity.iid + "&device_id=" + identity.deviceId
-                    + "&ac=wifi&channel=update_64&aid=8662&app_name=novelread"
-                    + "&version_code=74332&version_name=7.4.3.32&device_platform=android&os=android&ssmix=a"
-                    + "&device_type=25053RT47C&device_brand=Redmi&language=zh&os_api=36&os_version=16"
-                    + "&manifest_version_code=74332&resolution=1280*2772&dpi=520&update_version_code=74332"
-                    + "&host_abi=arm64-v8a&dragon_device_type=phone&pv_player=74332&compliance_status=0"
-                    + "&need_personal_recommend=1&player_so_load=1&is_android_pad_screen=0"
-                    + "&cdid=" + identity.cdid + "&tab_type=16&bottom_tab_type=7";
-            String url = WARMUP_URL + "?" + query;
-            Map<String, String> signature = new java.util.LinkedHashMap<>(PureSign.sign(url, null));
-            // 参考实现的预热只带 v3 时代五个头（gorgon/khronos/ladon/argus/helios），不带 medusa。
-            signature.remove("x-medusa");
-            Http.Req req = new Http.Req(url).method("GET").timeout(8000);
-            req.followRedirect = false;
-            req.header("accept", "application/json; charset=utf-8,application/x-protobuf");
-            req.header("x-ss-req-ticket", String.valueOf(now));
-            req.header("sdk-version", "2");
-            req.header("x-xs-from-web", "0");
-            req.header("user-agent", WARMUP_UA);
-            if (identity.cookie != null && !identity.cookie.isEmpty()) {
-                req.header("cookie", identity.cookie);
-            }
-            for (Map.Entry<String, String> header : signature.entrySet()) {
-                req.header(header.getKey(), header.getValue());
-            }
-            Http.Resp response = Http.send(req);
-            Log.info("播放身份预热：" + response.status + " / " + response.body.length + " 字节");
-        } catch (Exception failure) {
-            Log.warn("播放身份预热失败：" + failure.getClass().getSimpleName());
-        }
-    }
-
     /** 只留匿名注册下发的四个 Cookie，其他一律丢弃。 */
     static String cookieHeader(List<String> setCookies) {
         Map<String, String> kept = new java.util.LinkedHashMap<>();

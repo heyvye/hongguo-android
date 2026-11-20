@@ -21,5 +21,7 @@ class HongguoApplication : Application() {
         Config.initialize(config, cacheDir.resolve("media").absolutePath, deviceId)
         // 播放身份落盘目录：一次注册长期复用，避免反复注册消耗身份信誉。
         com.hongguo.api.service.PlaybackDevice.setStoreDir(filesDir)
+        // 诊断日志落盘（部分机型会吞掉 logcat）：filesDir/diag.log
+        com.hongguo.api.util.Diag.init(filesDir)
     }
 }
