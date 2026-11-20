@@ -4,6 +4,7 @@ import com.hongguo.api.core.PlayerSign;
 import com.hongguo.api.core.PureSign;
 import com.hongguo.api.core.Spade;
 import com.hongguo.api.util.Crypto;
+import com.hongguo.api.util.Diag;
 import com.hongguo.api.util.Http;
 import com.hongguo.api.util.Json;
 import com.hongguo.api.util.Log;
@@ -133,6 +134,22 @@ public final class AppSource {
         Exception failure = null;
         Exception modelFailure = null;
         IOException renewal = null;
+        // 2026-11-20 起：player/v1 的 v5 POST 与旧的签名 video_tab 都只回 200 + 0 字节，
+        // 唯一可用的取源路径是 video_tab 的 v5 无正文 GET（同步自 hongguo-drama 7.7）。
+        if (hasPlaybackTime(started, budgetMs)) {
+            try {
+                Stream.VideoTrack tab = fetchTabV5(vid, quality, identity);
+                if (tab != null) {
+                    PLAYBACK_IDENTITY.compareAndSet(null, identity);
+                    return tab;
+                }
+            } catch (InterruptedIOException cancelled) {
+                throw cancelled;
+            } catch (Exception tabFailure) {
+                // 该路径不可用时按原顺序继续尝试其余接口。
+                Diag.log("video_tab v5 failed: " + tabFailure.getClass().getSimpleName());
+            }
+        }
         // N3urda/hongguoTV 6672b55: v5 mobile endpoint first; bounded recovery from LiuWQ0809 89169c0.
         // Retain our route order, model-error precedence, cancellation and overall request budget.
         try {
@@ -197,7 +214,7 @@ public final class AppSource {
             if (!hasPlaybackTime(started, budgetMs)) break;
             if (route.renewsIdentity) {
                 try {
-                    identity = PlaybackDevice.fresh();
+                    identity = PlaybackDevice.renew();
                 } catch (IOException e) {
                     // 换身份失败（冷却或离线）时仍用原身份试完剩余路径。
                     if (Thread.currentThread().isInterrupted()) throw e;
@@ -240,6 +257,8 @@ public final class AppSource {
         }
         // 模型错误比 HTTP/空响应更能说明本集的情况（如仅有 ByteVC2），优先报告。
         if (modelFailure != null) throw modelFailure;
+        // 整次取流失败：丢弃落盘身份，下次播放重新注册一个（避免一直卡在同一身份上）。
+        PlaybackDevice.clearSaved();
         if (failure != null) throw failure;
         EmptyPlaybackResponseException empty = new EmptyPlaybackResponseException();
         if (renewal != null) empty.addSuppressed(renewal);
@@ -261,7 +280,11 @@ public final class AppSource {
         private PlaybackRejectedException(String message, boolean backoff) { super(message); this.backoff = backoff; }
 
         private void forgetRejectedIdentity(PlaybackDevice.Identity identity) {
-            if (!backoff) PLAYBACK_IDENTITY.compareAndSet(identity, null);
+            if (!backoff) {
+                PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                // 被明确拒绝的身份不能再从落盘恢复，否则每次播放都会拿它撞墙。
+                PlaybackDevice.clearSaved();
+            }
         }
     }
 
@@ -283,7 +306,10 @@ public final class AppSource {
         if (error instanceof PlaybackHttpException) {
             int status = ((PlaybackHttpException) error).status;
             if (status == 403 || status == 429) {
-                if (status == 403) PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                if (status == 403) {
+                    PLAYBACK_IDENTITY.compareAndSet(identity, null);
+                    PlaybackDevice.clearSaved();
+                }
                 checkPlaybackRejection(status);
             }
         }
@@ -871,11 +897,38 @@ public final class AppSource {
         return Json.stringify(payload).getBytes(StandardCharsets.UTF_8);
     }
 
+    /**
+     * video_tab 的 v5 无正文 GET 取源：2026-11-20 起 player/v1 的 v5 POST 与旧的签名
+     * video_tab 都只回空正文，这条路径是唯一可用的。响应仍为
+     * {@code data.video_model_data[vid].video_model}，复用 {@link #parseTabResponse}。
+     */
+    private static Stream.VideoTrack fetchTabV5(String vid, String quality, PlaybackDevice.Identity identity)
+            throws Exception {
+        com.hongguo.api.playback.MobilePlayerV5.TabRequest signed =
+                com.hongguo.api.playback.MobilePlayerV5.requestVideoTab(
+                        vid, identity.deviceId, identity.iid, identity.cdid, System.currentTimeMillis());
+        Http.Req req = new Http.Req(signed.getUrl()).method("GET").timeout(PLAYBACK_TIMEOUT_MS);
+        req.followRedirect = false;
+        for (Map.Entry<String, String> header : signed.getHeaders().entrySet()) {
+            req.header(header.getKey(), header.getValue());
+        }
+        Http.Resp response = Http.sendPlaybackMetadata(req, Long.MAX_VALUE);
+        checkPlaybackCancellation();
+        checkPlaybackResponse(response);
+        if (response.status != 200) throw new PlaybackHttpException(response.status);
+        if (response.body.length == 0) throw new EmptyPlaybackResponseException();
+        if (response.body.length > 2 * 1024 * 1024) throw new IOException("播放信息过大");
+        Map<String, Object> model = parseTabResponse(vid, response.text());
+        if (model == null) throw new IllegalStateException("video_tab 未返回本集播放模型");
+        return parseModel(vid, model, quality);
+    }
+
     /** v5 gzip 模型 POST；精确选择本集，沿用 parseModel 的编码与加密规则。 */
     private static Stream.VideoTrack fetchPrimary(String vid, String quality, PlaybackDevice.Identity identity) throws Exception {
         checkPlaybackCancellation();
         com.hongguo.api.playback.MobilePlayerV5.Request signed =
-                com.hongguo.api.playback.MobilePlayerV5.request(vid, identity.deviceId, identity.iid, identity.cdid, System.currentTimeMillis());
+                com.hongguo.api.playback.MobilePlayerV5.request(vid, identity.deviceId, identity.iid, identity.cdid,
+                        System.currentTimeMillis(), identity.cookie);
         Http.Req req = new Http.Req(signed.getUrl()).method("POST").timeout(PLAYBACK_TIMEOUT_MS);
         req.followRedirect = false;
         for (Map.Entry<String, String> header : signed.getHeaders().entrySet()) req.header(header.getKey(), header.getValue());

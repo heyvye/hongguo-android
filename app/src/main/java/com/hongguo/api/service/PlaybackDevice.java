@@ -2,13 +2,18 @@
 package com.hongguo.api.service;
 
 import com.hongguo.api.util.Crypto;
+import com.hongguo.api.util.Diag;
 import com.hongguo.api.util.Http;
 import com.hongguo.api.util.Json;
+import com.hongguo.api.util.Log;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.math.BigInteger;
@@ -87,6 +92,75 @@ public final class PlaybackDevice {
 
     private static final SecureRandom RND = new SecureRandom();
 
+    /** 匿名身份落盘目录；由 Application 设置，为空时只在内存里用（与旧行为一致）。 */
+    private static volatile File storeDir;
+
+    /** 只有拒绝（403/429/风控码）或整次取流失败时才丢弃落盘身份。 */
+    private static final String STORE_FILE = "playback_identity.json";
+
+    /** 设置身份落盘目录（应在 Application 启动时调用）。 */
+    public static void setStoreDir(File dir) {
+        storeDir = dir;
+    }
+
+    private static File storeFile() {
+        File dir = storeDir;
+        return dir == null ? null : new File(dir, STORE_FILE);
+    }
+
+    /** 读取上次保存的匿名身份；没有、损坏或为空时返回 null。 */
+    static Identity loadSaved() {
+        File file = storeFile();
+        if (file == null || !file.isFile()) return null;
+        try (FileInputStream in = new FileInputStream(file)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int count;
+            while ((count = in.read(buffer)) > 0) {
+                out.write(buffer, 0, count);
+                if (out.size() > 8192) return null;
+            }
+            Map<String, Object> json = Json.parseObject(out.toString("UTF-8"));
+            if (json == null) return null;
+            String deviceId = Json.optStr(json.get("device_id"), "");
+            String iid = Json.optStr(json.get("iid"), "");
+            String cdid = Json.optStr(json.get("cdid"), "");
+            String cookie = Json.optStr(json.get("cookie"), "");
+            if (!VALID_ID.matcher(deviceId).matches() || !VALID_ID.matcher(iid).matches()) return null;
+            return new Identity(deviceId, iid, cdid, cookie);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static void save(Identity identity) {
+        File file = storeFile();
+        if (file == null) return;
+        try {
+            Map<String, Object> json = Json.obj();
+            json.put("device_id", identity.deviceId);
+            json.put("iid", identity.iid);
+            json.put("cdid", identity.cdid);
+            json.put("cookie", identity.cookie == null ? "" : identity.cookie);
+            // 先写临时文件再改名，避免进程中断留下半个文件。
+            File temp = new File(file.getParentFile(), STORE_FILE + ".tmp");
+            try (FileOutputStream out = new FileOutputStream(temp)) {
+                out.write(Json.stringify(json).getBytes(StandardCharsets.UTF_8));
+            }
+            if (!temp.renameTo(file)) {
+                temp.delete();
+            }
+        } catch (Exception ignored) {
+            // 落盘失败不影响本次取流，下次照常注册。
+        }
+    }
+
+    /** 丢弃落盘身份（被明确拒绝或整次取流失败时调用）。 */
+    public static void clearSaved() {
+        File file = storeFile();
+        if (file != null) file.delete();
+    }
+
     /** 注册得到的匿名播放身份。toString 不输出真实值。 */
     public static final class Identity {
         public final String deviceId;
@@ -145,10 +219,38 @@ public final class PlaybackDevice {
     // ==================== 入口 ====================
 
     /**
-     * 注册一个新的匿名播放身份。身份可能只能用一次（同步自 hongguo-drama 5.5），所以每次取播放信息都
-     * 重新注册，并发调用各注册各的，注册期间不持锁。失败在冷却期内直接复用，避免预加载与重试造成注册风暴。
+     * 取得一个可用的匿名播放身份：优先复用上次落盘的身份（一次成功长期有效），
+     * 没有落盘身份时才注册新的。被拒绝或整次取流失败后由调用方 {@link #clearSaved()} 丢弃。
      */
     public static Identity fresh() throws IOException {
+        Identity saved = loadSaved();
+        if (saved != null) {
+            Diag.log("identity: reusing saved device_id=" + mask(saved.deviceId));
+            return saved;
+        }
+        return renew();
+    }
+
+    /**
+     * 强制注册一个新的匿名播放身份（已知身份被拒绝、或落盘身份被丢弃后使用）。
+     * 失败在冷却期内直接复用，避免预加载与重试造成注册风暴。
+     */
+    public static Identity renew() throws IOException {
+        Diag.log("identity: registering a new device");
+        Identity identity = registerFresh();
+        save(identity);
+        Diag.log("identity: registered device_id=" + mask(identity.deviceId)
+                + " cookie=" + (identity.cookie == null || identity.cookie.isEmpty() ? "none" : "yes"));
+        return identity;
+    }
+
+    private static String mask(String value) {
+        if (value == null) return "(null)";
+        return value.length() <= 4 ? "****" : value.substring(0, 4) + "***" + value.substring(value.length() - 2);
+    }
+
+    /** 注册一个新身份但不落盘（推荐流等独立身份用）。 */
+    private static Identity registerFresh() throws IOException {
         long now;
         synchronized (PlaybackDevice.class) {
             now = now();
@@ -188,7 +290,7 @@ public final class PlaybackDevice {
             if (recommendationIdentity != null) return recommendationIdentity;
         }
         try {
-            Identity identity = fresh();
+            Identity identity = registerFresh();
             synchronized (PlaybackDevice.class) {
                 if (recommendationIdentity == null) recommendationIdentity = identity;
                 return recommendationIdentity;
@@ -218,6 +320,7 @@ public final class PlaybackDevice {
         RND.nextBytes(random);
         byte[] body = buildBody(now, cdid, random);
         Reply res = transport.post(REGISTER_URL, headers(body, now), body);
+        Diag.log("device_register -> " + res.status + " bytes=" + (res.text == null ? 0 : res.text.length()));
         if (res.status != 200) throw new IOException("register HTTP " + res.status);
         Map<String, Object> j;
         try {
@@ -225,9 +328,9 @@ public final class PlaybackDevice {
         } catch (Exception e) {
             throw new IOException("register response is not JSON");
         }
-        return parse(j, cdid, cookieHeader(res.setCookies));
+        Identity identity = parse(j, cdid, cookieHeader(res.setCookies));
+        return identity;
     }
-
     /** 只留匿名注册下发的四个 Cookie，其他一律丢弃。 */
     static String cookieHeader(List<String> setCookies) {
         Map<String, String> kept = new java.util.LinkedHashMap<>();

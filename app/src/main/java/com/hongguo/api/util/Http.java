@@ -107,6 +107,8 @@ public final class Http {
             if (remaining <= 0) throw new SocketTimeoutException("播放取流超时");
             timeout = (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining));
         }
+        final boolean diag = isDiagnostic(req.url);
+        final String target = Diag.endpoint(req.url);
         HttpURLConnection conn;
         try { conn = open(req.url, req.followRedirect); }
         catch (Exception ignored) { throw new IOException("网络请求地址无效"); }
@@ -132,6 +134,7 @@ public final class Http {
                 }
             }
             int status = conn.getResponseCode();
+            if (diag) Diag.log(req.method + " " + target + " -> " + status);
             if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
                 if (!req.followRedirect) return new Resp(status, new byte[0], conn.getHeaderFields());
                 if (redirects >= 3 || !(req.method.equals("GET") || req.method.equals("HEAD")))
@@ -153,17 +156,22 @@ public final class Http {
             // 错误码也可能有响应体（上游风控时返回 JSON 错误）
             InputStream is = (status >= 400) ? conn.getErrorStream() : conn.getInputStream();
             byte[] data = readAll(is, deadline);
+            if (diag) Diag.log("  bytes=" + data.length + " encoding=" + conn.getHeaderField("Content-Encoding")
+                    + " length=" + conn.getHeaderField("Content-Length"));
             if (playback && data.length != 0 && "gzip".equalsIgnoreCase(conn.getHeaderField("Content-Encoding"))) {
                 data = readAll(new GZIPInputStream(new ByteArrayInputStream(data)), deadline);
             }
             return new Resp(status, data, conn.getHeaderFields());
         } catch (SocketTimeoutException ignored) {
+            if (diag) Diag.log(req.method + " " + target + " FAIL timeout");
             throw new SocketTimeoutException("网络请求超时");
         } catch (InterruptedIOException ignored) {
+            if (diag) Diag.log(req.method + " " + target + " FAIL interrupted");
             throw new InterruptedIOException("请求已取消或超时");
         } catch (SocketException failure) {
             // Only connection refusal/reset is eligible for the playback GET retry. Drop the original URL.
             String message = String.valueOf(failure.getMessage()).toLowerCase(java.util.Locale.ROOT);
+            if (diag) Diag.log(req.method + " " + target + " FAIL socket " + failure.getClass().getSimpleName());
             if (playback && (failure instanceof ConnectException || message.contains("connection reset")
                     || message.contains("econnreset") || message.contains("broken pipe"))) {
                 throw new SocketException("网络连接中断");
@@ -171,10 +179,17 @@ public final class Http {
             throw new IOException("网络请求失败");
         } catch (IOException ignored) {
             // Transport exception messages may include signed URLs or response fragments.
+            if (diag) Diag.log(req.method + " " + target + " FAIL io " + ignored.getClass().getSimpleName());
             throw new IOException("网络请求失败");
         } finally {
             conn.disconnect();
         }
+    }
+
+    /** 只对播放与目录接口打诊断日志，避免把普通请求刷满 logcat。 */
+    private static boolean isDiagnostic(String url) {
+        if (url == null) return false;
+        return url.contains("/novel/") || url.contains("video_tab") || url.contains("/reading/");
     }
 
     private static HttpURLConnection open(String url, boolean follow) throws IOException {
