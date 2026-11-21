@@ -48,6 +48,9 @@ internal fun DanmakuOverlay(
             }
         }
     }
+    // 设置变更（占比/字号/透明度/效果/速度）只记一行，方便对照观感。
+    LaunchedEffect(settings) {
+    }
     // A plain holder, not Compose state: re-binding must not re-run composition.
     val boundPlayer = remember { arrayOfNulls<ExoPlayer>(1) }
     AndroidView(

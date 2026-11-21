@@ -72,10 +72,15 @@ internal class DanmakuRepository(
      * anonymous surface, so a per-process install id is used instead of the playback identity;
      * the two must always match or the gateway drops the request.
      */
-    private val device: Map<String, String> = VendorConstants.device,
-    private val signer: Signer = Signer(device = device),
+    private var device: Map<String, String> = VendorConstants.device,
+    private var signer: Signer = Signer(device = device),
     /** 播放器形态（v5）签名器：评论接口若被迁到 player 签名族，靠它自动接上。 */
-    private val playerSigner: Signer = Signer(device = device, mobileV5 = true),
+    private var playerSigner: Signer = Signer(device = device, mobileV5 = true),
+    /**
+     * 身份择优用的候选身份生成器；为 null 时不启用（测试默认关闭）。
+     * 服务端按匿名身份分配弹幕子集，同一窗口换身份可差 3~6 倍。
+     */
+    private val identityCandidates: (() -> Map<String, String>)? = null,
     private val clock: () -> Long = System::currentTimeMillis,
     private val sleep: (Long) -> Unit = { Thread.sleep(it) },
     private val random: () -> Double = Math::random,
@@ -88,6 +93,9 @@ internal class DanmakuRepository(
     /** 当前使用的主机与签名形态；成功后保持不变，失败或空正文时轮换。 */
     private var hostIndex = 0
     private var modeIndex = 0
+
+    /** 每个进程只做一次身份比较，避免反复抽奖。 */
+    private var identityChecked = false
 
     /** Comments of one 30-second window plus the server-suggested start of the next window. */
     data class Window(val comments: List<Danmaku>, val nextStartMs: Long)
@@ -102,15 +110,75 @@ internal class DanmakuRepository(
         var cursor = ""
         var nextStart = -1L
         var pages = 0
+
         while (true) {
-            val page = fetchWithRetry(seriesId, vid, durationMs, startMs, cursor)
+            var page = fetchWithRetry(seriesId, vid, durationMs, startMs, cursor)
+            if (pages == 0) page = maybeImproveIdentity(seriesId, vid, durationMs, startMs, cursor, page)
             comments += page.comments
             if (nextStart < 0) nextStart = page.nextStartMs
             cursor = page.cursor
             pages++
+
             if (!page.hasMore || cursor.isEmpty() || pages >= MAX_PAGES_PER_WINDOW) break
         }
-        return Window(dedupe(comments), if (nextStart > startMs) nextStart else startMs + WINDOW_MS)
+        val deduped = dedupe(comments)
+        return Window(deduped, if (nextStart > startMs) nextStart else startMs + WINDOW_MS)
+    }
+
+    /**
+     * 身份择优：首次遇到"有弹幕但不多"的窗口时，用同一个窗口再请求一个候选身份，
+     * 留条数多的那个。服务端按匿名身份分配弹幕子集，同一窗口换身份可差 3~6 倍。
+     *
+     * 只在 1..[IDENTITY_COMPARE_MAX] 条之间比较：0 条说明该集没人发（比也没意义），
+     * 超过上限说明当前身份已经够密。每个进程只比较一次，身份不落盘，重启重来。
+     */
+    private fun maybeImproveIdentity(
+        seriesId: String,
+        vid: String,
+        durationMs: Long,
+        startMs: Long,
+        cursor: String,
+        page: Page,
+    ): Page {
+        val provider = identityCandidates ?: return page
+        if (identityChecked) return page
+        val current = page.comments.size
+        if (current <= 0) return page          // 这集没人发弹幕，留到下一个有弹幕的窗口再判断
+        if (current > IDENTITY_COMPARE_MAX) {
+            identityChecked = true             // 已经够密，不再比较
+            return page
+        }
+        identityChecked = true
+        val candidate = try {
+            provider()
+        } catch (failure: Exception) {
+            return page
+        }
+        val candidatePage = try {
+            val text = sendWith(
+                dev = candidate,
+                appSigner = Signer(device = candidate),
+                player = Signer(device = candidate, mobileV5 = true),
+                vid = vid,
+                body = body(seriesId, vid, durationMs, startMs, cursor),
+            )
+            if (text.isBlank()) return page
+            parse(text, startMs)
+        } catch (failure: Exception) {
+            return page
+        }
+        return if (candidatePage.comments.size > current) {
+            adoptIdentity(candidate)
+            candidatePage
+        } else {
+            page
+        }
+    }
+
+    private fun adoptIdentity(next: Map<String, String>) {
+        device = next
+        signer = Signer(device = next)
+        playerSigner = Signer(device = next, mobileV5 = true)
     }
 
     private fun fetchWithRetry(seriesId: String, vid: String, durationMs: Long, startMs: Long, cursor: String): Page {
@@ -176,11 +244,23 @@ internal class DanmakuRepository(
         return ""
     }
 
-    private fun send(vid: String, body: ByteArray): String {
-        val base = CommentProtocol.hosts()[hostIndex] + CommentProtocol.path(vid)
-        val signed = when (SignatureMode.entries[modeIndex]) {
-            SignatureMode.APP -> signer.sign(base, device, body)
-            SignatureMode.PLAYER -> playerSigner.signPlayback(base, device, body)
+    private fun send(vid: String, body: ByteArray): String =
+        sendWith(device, signer, playerSigner, vid, body)
+
+    /** 用指定身份与签名器发一次请求；身份择优时用来试候选身份。 */
+    private fun sendWith(
+        dev: Map<String, String>,
+        appSigner: Signer,
+        player: Signer,
+        vid: String,
+        body: ByteArray,
+    ): String {
+        val host = CommentProtocol.hosts()[hostIndex]
+        val mode = SignatureMode.entries[modeIndex]
+        val base = host + CommentProtocol.path(vid)
+        val signed = when (mode) {
+            SignatureMode.APP -> appSigner.sign(base, dev, body)
+            SignatureMode.PLAYER -> player.signPlayback(base, dev, body)
         }
         val request = Request.Builder().url(signed.url)
             .header("User-Agent", VendorConstants.VIDEO_UA)
@@ -189,15 +269,23 @@ internal class DanmakuRepository(
             .apply { signed.headers.forEach { (key, value) -> header(key, value) } }
             .post((signed.body ?: body).toRequestBody(JSON_MEDIA))
             .build()
-        return http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("弹幕请求失败（HTTP ${response.code}）")
-            // The gateway silently drops intercepted requests with an HTTP 200 empty body;
-            // an empty reply must surface as "no comments", never as a parse crash.
-            val payload = response.body ?: return@use ""
-            if (payload.contentLength() > MAX_BYTES) throw IOException("弹幕响应过大")
-            val bytes = payload.bytes()
-            if (bytes.size > MAX_BYTES) throw IOException("弹幕响应过大")
-            String(bytes, Charsets.UTF_8)
+        val started = clock()
+        val label = "vid=$vid host=${host.substringAfter("//")} mode=$mode"
+        try {
+            return http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IOException("弹幕请求失败（HTTP ${response.code}）")
+                }
+                // The gateway silently drops intercepted requests with an HTTP 200 empty body;
+                // an empty reply must surface as "no comments", never as a parse crash.
+                val payload = response.body ?: return@use ""
+                if (payload.contentLength() > MAX_BYTES) throw IOException("弹幕响应过大")
+                val bytes = payload.bytes()
+                if (bytes.size > MAX_BYTES) throw IOException("弹幕响应过大")
+                String(bytes, Charsets.UTF_8)
+            }
+        } catch (failure: IOException) {
+            throw failure
         }
     }
 
@@ -246,6 +334,8 @@ internal class DanmakuRepository(
         /** 每次请求最多尝试两套主机／签名组合，避免失败时连发请求触发风控。 */
         private const val MAX_TRANSPORT_TRIES = 2
         private const val MAX_PAGES_PER_WINDOW = 3
+        /** 身份择优的比较上限：1..19 条才值得比较，≥20 视为当前身份已经够密。 */
+        private const val IDENTITY_COMPARE_MAX = 19
         private const val MAX_COOLDOWN_RETRIES = 2
         private const val THROTTLE_MS = 180L
         private const val THROTTLE_JITTER_MS = 240L
@@ -285,18 +375,39 @@ internal object DanmakuApi {
             .callTimeout(45, TimeUnit.SECONDS)
             .build()
     }
+
     /**
      * Anonymous comment identity. The platform bans identities it sees abused, so comments get
-     * fresh install ids once per process instead of the playback identity; query and medusa must
-     * carry the same ids.
+     * fresh install ids instead of the playback identity; query and medusa must carry the same
+     * ids.
+     *
+     * 服务端按匿名标识分配弹幕子集（同一时间窗不同身份可差 3 倍），这里选择每个进程随机：
+     * 不做持久化，也不提供"重新分配"入口——数量随身份波动属于服务端策略，不是故障。
      */
     private val device: Map<String, String> by lazy {
+        val iid = randomInstallId()
+        val deviceId = randomInstallId()
         VendorConstants.device.toMutableMap().apply {
-            put("iid", randomInstallId())
-            put("device_id", randomInstallId())
+            put("iid", iid)
+            put("device_id", deviceId)
         }
     }
-    val repository: DanmakuRepository by lazy { DanmakuRepository(http, device, Signer(device = device)) }
+
+    val repository: DanmakuRepository by lazy {
+        DanmakuRepository(
+            http = http,
+            device = device,
+            signer = Signer(device = device),
+            playerSigner = Signer(device = device, mobileV5 = true),
+            identityCandidates = ::candidateDevice,
+        )
+    }
+
+    /** 择优用的候选身份：同一套设备参数，只换 iid/device_id。 */
+    private fun candidateDevice(): Map<String, String> = VendorConstants.device.toMutableMap().apply {
+        put("iid", randomInstallId())
+        put("device_id", randomInstallId())
+    }
 
     private fun randomInstallId(): String = buildString(16) {
         append('1')

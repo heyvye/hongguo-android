@@ -13,6 +13,23 @@ class DanmakuEmojiTest {
         assertEquals("😍😍😍", DanmakuEmoji.display("[爱慕][爱慕][爱慕]"))
     }
 
+    @Test fun `codes found in live traffic are replaced`() {
+        assertEquals("😘", DanmakuEmoji.display("[飞吻]"))
+        assertEquals("🥺", DanmakuEmoji.display("[没看够]"))
+        assertEquals("还没看够🥺", DanmakuEmoji.display("还没看够[没看够]"))
+        assertEquals("😋", DanmakuEmoji.display("[舔屏]"))
+        assertEquals("😅", DanmakuEmoji.display("[尬笑]"))
+        assertEquals("💕", DanmakuEmoji.display("[送心]"))
+        assertEquals("❓", DanmakuEmoji.display("[什么]"))
+        assertEquals("😒", DanmakuEmoji.display("[撇嘴]"))
+        assertEquals("🧐", DanmakuEmoji.display("[你细品]"))
+        assertEquals("🥲", DanmakuEmoji.display("[快哭了]"))
+        assertEquals("😢", DanmakuEmoji.display("[伤心]"))
+        assertEquals("🔍", DanmakuEmoji.display("[探究]"))
+        assertEquals("🗿", DanmakuEmoji.display("[石化]"))
+        assertEquals("😨", DanmakuEmoji.display("[恐惧]"))
+    }
+
     @Test fun `unknown code is kept verbatim`() {
         assertEquals("[不存在的表情]", DanmakuEmoji.display("[不存在的表情]"))
         assertEquals("前缀[不存在的表情]后缀", DanmakuEmoji.display("前缀[不存在的表情]后缀"))
