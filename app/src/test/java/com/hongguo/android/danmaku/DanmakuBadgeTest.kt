@@ -29,14 +29,14 @@ class DanmakuBadgeTest {
     }
 
     @Test fun `thousands use k with one decimal`() {
-        assertEquals("1.0k", DanmakuBadge.format(1_000))
-        assertEquals("3.5k", DanmakuBadge.format(3_485))
-        assertEquals("9.9k", DanmakuBadge.format(9_949))
+        assertEquals("1.0K", DanmakuBadge.format(1_000))
+        assertEquals("3.5K", DanmakuBadge.format(3_485))
+        assertEquals("9.9K", DanmakuBadge.format(9_949))
     }
 
     @Test fun `ten thousand and above use w with one decimal`() {
-        assertEquals("1.0w", DanmakuBadge.format(10_000))
-        assertEquals("1.2w", DanmakuBadge.format(12_333))
-        assertEquals("23.4w", DanmakuBadge.format(234_000))
+        assertEquals("1.0W", DanmakuBadge.format(10_000))
+        assertEquals("1.2W", DanmakuBadge.format(12_333))
+        assertEquals("23.4W", DanmakuBadge.format(234_000))
     }
 }

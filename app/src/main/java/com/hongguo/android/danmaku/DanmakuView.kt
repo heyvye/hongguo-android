@@ -66,7 +66,10 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
     private var currentCrossMs = crossMs
     /** Comments hitting a blocked word are dropped before track allocation. */
     private var blocked: (String) -> Boolean = { false }
-    private val gapPx = 24 * resources.displayMetrics.density
+    /** 同轨前后间距，随「密度」档位变化。 */
+    private var gapPx = 24 * resources.displayMetrics.density
+    /** 行距系数，随「密度」档位变化。 */
+    private var linePitch = 1.12f
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textSize = baseTextSize
@@ -119,12 +122,13 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
     private class BadgeMetrics(val width: Float, val height: Float, val iconSize: Float)
 
     private fun badgeMetrics(badge: String): BadgeMetrics {
-        val iconSize = badgeTextPaint.textSize * BADGE_ICON_SCALE
-        val metrics = badgeTextPaint.fontMetrics
+        // 与正文同高（约 0.9 倍字号），图标和数字都收在这个高度里。
+        val height = paint.textSize * BADGE_HEIGHT
+        val iconSize = height * BADGE_ICON_RATIO
         return BadgeMetrics(
             width = badgeDim(BADGE_H_PAD) * 2 + iconSize + badgeDim(BADGE_ICON_GAP) +
                 badgeTextPaint.measureText(badge),
-            height = maxOf(iconSize, metrics.descent - metrics.ascent) + badgeDim(BADGE_V_PAD) * 2,
+            height = height,
             iconSize = iconSize,
         )
     }
@@ -159,7 +163,13 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
      * flying. The row count is never set from outside: [relayout] derives it from the band height
      * and the current font, so the coverage fraction chosen by the user translates into real rows.
      */
-    fun applyPrefs(opacityPct: Int, font: Int, speed: Int, effect: Int) {
+    fun applyPrefs(
+        opacityPct: Int,
+        font: Int,
+        speed: Int,
+        effect: Int,
+        density: Int = DanmakuPrefs.DENSITY_DEFAULT,
+    ) {
         val oldTextSize = paint.textSize
         val alpha = DanmakuPrefs.opacity(opacityPct) * 255 / 100
         paint.alpha = alpha
@@ -209,6 +219,8 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
             badgeTextPaint.clearShadowLayer()
         }
         currentCrossMs = (baseCrossMs * DanmakuPrefs.speedScale(speed)).toLong().coerceAtLeast(1)
+        linePitch = DanmakuPrefs.densityLinePitch(density)
+        gapPx = DanmakuPrefs.densityGapDp(density) * resources.displayMetrics.density
         relayout()
         if (paint.textSize != oldTextSize) {
             // 字号只是把字放大缩小，不该把正在飞的弹幕清空：按新字号重新量一遍宽度，
@@ -254,9 +266,11 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
         // 也比把行距拉宽塞满整块带更接近用户设定的比例、字距也上下一致。
         val metrics = paint.fontMetrics
         val ink = (metrics.descent - metrics.ascent).coerceAtLeast(1f)
-        lineHeight = ink * ROW_PITCH
+        lineHeight = ink * linePitch
         val band = if (bandHeightPx > 0f) minOf(bandHeightPx, height.toFloat()) else height.toFloat()
-        tracks = kotlin.math.round(band / lineHeight).toInt().coerceAtLeast(1)
+        // 偏置 0.05：卡在边界上的档位（如 1/6 + 大）多拿一行；最大顶出 0.55 行，
+        // 仍在 0.61 行的绘制余量（0.8 × 字高）之内，不会被裁。
+        tracks = kotlin.math.round(band / lineHeight + TRACK_ROUND_BIAS).toInt().coerceAtLeast(1)
     }
 
     /** 告知视图“用户选的那块带子有多高”，视图自身高度可以比它多一点用于越界绘制。 */
@@ -498,19 +512,22 @@ internal class DanmakuView(context: Context, textSizeSp: Float = 18f, crossMs: L
         private const val BASE_FONT_DP = 18f
         /** 点赞数文字相对正文字号的比例。 */
         private const val BADGE_TEXT_SCALE = 0.82f
-        /** 图标相对点赞数字号的比例：比数字略大一点点即可。 */
-        private const val BADGE_ICON_SCALE = 1.1f
+        /** 徽章高度相对正文字号：与正文看起来一样高。 */
+        private const val BADGE_HEIGHT = 0.9f
+        /** 图标占徽章高度的比例。 */
+        private const val BADGE_ICON_RATIO = 0.82f
         /** 徽章几何，单位为「基准单位」（正文 18dp 时等于 dp）。 */
         private const val BADGE_STROKE = 1f
         private const val BADGE_RIM = 0.5f
         private const val BADGE_CORNER = 3f
         private const val BADGE_H_PAD = 4f
-        private const val BADGE_V_PAD = 1.5f
+
         private const val BADGE_ICON_GAP = 2f
         private const val BADGE_GAP = 6f
         private const val SEEK_TOLERANCE_MS = 250L
         private const val SEEK_FORWARD_MS = 1_000L
         /** 行距相对字高的倍数；行数用带高除以它之后四舍五入。 */
-        private const val ROW_PITCH = 1.12f
+        /** 行数四舍五入的偏置：0.05 行约等于「边界情况多给一行」。 */
+        private const val TRACK_ROUND_BIAS = 0.05f
     }
 }

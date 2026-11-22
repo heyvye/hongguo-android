@@ -35,14 +35,18 @@ object DanmakuEmoji {
         // 2026-11-21 十小时真机使用日志里出现的缺失码。
         "你细品" to "🧐", "快哭了" to "🥲", "伤心" to "😢", "探究" to "🔍",
         "石化" to "🗿", "恐惧" to "😨",
+        // 2026-11-21 晚间日志补上的缺失码。
+        "做鬼脸" to "😝", "懂了" to "💡", "注意" to "⚠️",
+        // 2026-11-21 深夜日志补上的缺失码。
+        "学会了" to "🎓", "重拳出击" to "👊", "饱了" to "😋",
+        // 2026-11-22 日志补上的缺失码。
+        "敬礼" to "🫡", "求爆更" to "🙏", "顶帖" to "🔝", "惊呆" to "😲", "悲伤" to "😔",
+        "心疼" to "💔", "点赞" to "👍", "心" to "❤️", "泪" to "😭",
         // 同一批扫描里没有出现、但名称与图形一一对应的常见码，先补上以免将来显示成方括号。
         "抱拳" to "🙏", "膜拜" to "🙇", "红包" to "🧧", "蛋糕" to "🎂", "啤酒" to "🍺",
         "咖啡" to "☕", "牛" to "🐮", "猪" to "🐷", "猫" to "🐱", "摸鱼" to "🐟",
         "干饭" to "🍚", "委屈" to "🥺", "裂开" to "💔", "打call" to "🙌",
     )
-
-    /** 只上报一次同一种未知码，避免每帧刷日志。 */
-    private val reported = java.util.Collections.synchronizedSet(HashSet<String>())
 
     /** Expands every recognized "[code]" to its emoji, leaving the rest of [text] and unknown codes as-is. */
     fun display(text: String): String {
@@ -68,12 +72,7 @@ object DanmakuEmoji {
             out.append(clean, i, open)
             val code = clean.substring(open + 1, close)
             val emoji = TABLE[code.lowercase()]
-            if (emoji != null) {
-                out.append(emoji)
-            } else {
-                // 未收录的表情码保留原文，同时记一次，方便以后按真实流量补表。
-                out.append(clean, open, close + 1)
-            }
+            if (emoji != null) out.append(emoji) else out.append(clean, open, close + 1)
             i = close + 1
         }
         return out.toString()

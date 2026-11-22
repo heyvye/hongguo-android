@@ -48,21 +48,20 @@ internal fun DanmakuOverlay(
             }
         }
     }
-    // 设置变更（占比/字号/透明度/效果/速度）只记一行，方便对照观感。
-    LaunchedEffect(settings) {
-    }
     // A plain holder, not Compose state: re-binding must not re-run composition.
     val boundPlayer = remember { arrayOfNulls<ExoPlayer>(1) }
     AndroidView(
         factory = { context ->
             DanmakuView(context).also {
                 it.setBandHeight(bandHeightPx)
-                it.applyPrefs(settings.opacity, settings.font, settings.speed, settings.effect)
+                it.applyPrefs(settings.opacity, settings.font, settings.speed, settings.effect,
+                    settings.density)
             }
         },
         update = { view ->
             view.setBandHeight(bandHeightPx)
-            view.applyPrefs(settings.opacity, settings.font, settings.speed, settings.effect)
+            view.applyPrefs(settings.opacity, settings.font, settings.speed, settings.effect,
+                settings.density)
             val active = player
             if (active == null) {
                 if (boundPlayer[0] != null) {

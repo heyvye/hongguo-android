@@ -66,7 +66,6 @@ class DanmakuRepositoryTest {
             http = http,
             device = primary,
             signer = Signer(device = primary, clock = { 1_792_016_000_000L }, random = { 0.0 }),
-            playerSigner = Signer(device = primary, mobileV5 = true, clock = { 1_792_016_000_000L }, random = { 0.0 }),
             identityCandidates = { identity(candidates[next++]) },
             clock = { now }, sleep = { sleeps += it }, random = { 0.0 },
         )

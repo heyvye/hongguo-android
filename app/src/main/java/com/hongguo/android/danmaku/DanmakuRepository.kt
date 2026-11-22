@@ -53,8 +53,6 @@ internal object CommentProtocol {
     ).distinct()
 }
 
-/** 请求签名形态：App 形态（完整签名头）与播放器形态（v5 三头）。 */
-private enum class SignatureMode { APP, PLAYER }
 
 /**
  * Pulls the platform's official time-anchored comments (弹幕) for one episode, one 30-second
@@ -62,8 +60,7 @@ private enum class SignatureMode { APP, PLAYER }
  * gateway-policed; a risk-control reply carries a server-dictated cooldown that is honored
  * before retrying. Empty or censored replies degrade to an empty window instead of failing.
  *
- * 主机与签名形态会在失败或空正文时自动轮换：上游只改其中一维（换域或换签名族）时，
- * 弹幕不需要改代码就能继续工作。
+ * 遇到空正文或失败时换一个主机重试；签名形态固定为 App 形态（评论接口只认这一种）。
  */
 internal class DanmakuRepository(
     private val http: OkHttpClient,
@@ -74,8 +71,7 @@ internal class DanmakuRepository(
      */
     private var device: Map<String, String> = VendorConstants.device,
     private var signer: Signer = Signer(device = device),
-    /** 播放器形态（v5）签名器：评论接口若被迁到 player 签名族，靠它自动接上。 */
-    private var playerSigner: Signer = Signer(device = device, mobileV5 = true),
+
     /**
      * 身份择优用的候选身份生成器；为 null 时不启用（测试默认关闭）。
      * 服务端按匿名身份分配弹幕子集，同一窗口换身份可差 3~6 倍。
@@ -90,9 +86,9 @@ internal class DanmakuRepository(
     // the latter overflows the subtraction and sleeps effectively forever.
     private var lastRequestAt = -1L
 
-    /** 当前使用的主机与签名形态；成功后保持不变，失败或空正文时轮换。 */
+    /** 当前使用的主机；成功后保持不变，失败或空正文时换下一个。 */
     private var hostIndex = 0
-    private var modeIndex = 0
+
 
     /** 每个进程只做一次身份比较，避免反复抽奖。 */
     private var identityChecked = false
@@ -110,7 +106,6 @@ internal class DanmakuRepository(
         var cursor = ""
         var nextStart = -1L
         var pages = 0
-
         while (true) {
             var page = fetchWithRetry(seriesId, vid, durationMs, startMs, cursor)
             if (pages == 0) page = maybeImproveIdentity(seriesId, vid, durationMs, startMs, cursor, page)
@@ -118,7 +113,6 @@ internal class DanmakuRepository(
             if (nextStart < 0) nextStart = page.nextStartMs
             cursor = page.cursor
             pages++
-
             if (!page.hasMore || cursor.isEmpty() || pages >= MAX_PAGES_PER_WINDOW) break
         }
         val deduped = dedupe(comments)
@@ -158,7 +152,6 @@ internal class DanmakuRepository(
             val text = sendWith(
                 dev = candidate,
                 appSigner = Signer(device = candidate),
-                player = Signer(device = candidate, mobileV5 = true),
                 vid = vid,
                 body = body(seriesId, vid, durationMs, startMs, cursor),
             )
@@ -178,7 +171,6 @@ internal class DanmakuRepository(
     private fun adoptIdentity(next: Map<String, String>) {
         device = next
         signer = Signer(device = next)
-        playerSigner = Signer(device = next, mobileV5 = true)
     }
 
     private fun fetchWithRetry(seriesId: String, vid: String, durationMs: Long, startMs: Long, cursor: String): Page {
@@ -225,8 +217,8 @@ internal class DanmakuRepository(
     }
 
     /**
-     * 取一页评论。先用当前主机与签名形态；遇到空正文（网关软拦截的固定表现）或传输失败时，
-     * 轮换到下一个主机／签名形态再试一次——上游只改其中一维时无需改代码即可自愈。
+     * 取一页评论。先用当前主机；遇到空正文（网关软拦截的固定表现）或传输失败时，
+     * 换下一个主机再试一次。
      */
     private fun post(vid: String, body: ByteArray): String {
         throttle()
@@ -238,30 +230,25 @@ internal class DanmakuRepository(
             } catch (failure: IOException) {
                 if (firstFailure == null) firstFailure = failure
             }
-            advanceTransport()
+            advanceHost()
         }
         firstFailure?.let { throw it }
         return ""
     }
 
     private fun send(vid: String, body: ByteArray): String =
-        sendWith(device, signer, playerSigner, vid, body)
+        sendWith(device, signer, vid, body)
 
     /** 用指定身份与签名器发一次请求；身份择优时用来试候选身份。 */
     private fun sendWith(
         dev: Map<String, String>,
         appSigner: Signer,
-        player: Signer,
         vid: String,
         body: ByteArray,
     ): String {
         val host = CommentProtocol.hosts()[hostIndex]
-        val mode = SignatureMode.entries[modeIndex]
         val base = host + CommentProtocol.path(vid)
-        val signed = when (mode) {
-            SignatureMode.APP -> appSigner.sign(base, dev, body)
-            SignatureMode.PLAYER -> player.signPlayback(base, dev, body)
-        }
+        val signed = appSigner.sign(base, dev, body)
         val request = Request.Builder().url(signed.url)
             .header("User-Agent", VendorConstants.VIDEO_UA)
             .header("comment-source", CommentProtocol.COMMENT_SOURCE.toString())
@@ -269,33 +256,21 @@ internal class DanmakuRepository(
             .apply { signed.headers.forEach { (key, value) -> header(key, value) } }
             .post((signed.body ?: body).toRequestBody(JSON_MEDIA))
             .build()
-        val started = clock()
-        val label = "vid=$vid host=${host.substringAfter("//")} mode=$mode"
-        try {
-            return http.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    throw IOException("弹幕请求失败（HTTP ${response.code}）")
-                }
-                // The gateway silently drops intercepted requests with an HTTP 200 empty body;
-                // an empty reply must surface as "no comments", never as a parse crash.
-                val payload = response.body ?: return@use ""
-                if (payload.contentLength() > MAX_BYTES) throw IOException("弹幕响应过大")
-                val bytes = payload.bytes()
-                if (bytes.size > MAX_BYTES) throw IOException("弹幕响应过大")
-                String(bytes, Charsets.UTF_8)
-            }
-        } catch (failure: IOException) {
-            throw failure
+        return http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("弹幕请求失败（HTTP ${response.code}）")
+            // The gateway silently drops intercepted requests with an HTTP 200 empty body;
+            // an empty reply must surface as "no comments", never as a parse crash.
+            val payload = response.body ?: return@use ""
+            if (payload.contentLength() > MAX_BYTES) throw IOException("弹幕响应过大")
+            val bytes = payload.bytes()
+            if (bytes.size > MAX_BYTES) throw IOException("弹幕响应过大")
+            String(bytes, Charsets.UTF_8)
         }
     }
 
-    /** 主机用完再换签名形态：两个维度都轮换，任一维度变化都能自愈。 */
-    private fun advanceTransport() {
-        hostIndex++
-        if (hostIndex >= CommentProtocol.hosts().size) {
-            hostIndex = 0
-            modeIndex = (modeIndex + 1) % SignatureMode.entries.size
-        }
+    /** 空正文或失败时换下一个主机：协议与签名不变，只换域名。 */
+    private fun advanceHost() {
+        hostIndex = (hostIndex + 1) % CommentProtocol.hosts().size
     }
 
     private fun parse(raw: String, startMs: Long): Page {
@@ -398,7 +373,6 @@ internal object DanmakuApi {
             http = http,
             device = device,
             signer = Signer(device = device),
-            playerSigner = Signer(device = device, mobileV5 = true),
             identityCandidates = ::candidateDevice,
         )
     }
