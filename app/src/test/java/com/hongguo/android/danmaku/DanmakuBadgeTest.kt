@@ -9,15 +9,16 @@ import org.junit.Test
 class DanmakuBadgeTest {
     @Test fun `counts below the threshold are hidden`() {
         assertFalse(DanmakuBadge.show(0))
-        assertFalse(DanmakuBadge.show(49))
-        assertTrue(DanmakuBadge.show(50))
+        assertFalse(DanmakuBadge.show(19))
+        assertTrue(DanmakuBadge.show(20))
         assertTrue(DanmakuBadge.show(500))
     }
 
     @Test fun `under one hundred is floored to the ten and suffixed with plus`() {
-        assertEquals("50+", DanmakuBadge.format(50))
+        assertEquals("20+", DanmakuBadge.format(20))
+        assertEquals("20+", DanmakuBadge.format(27))
+        assertEquals("40+", DanmakuBadge.format(49))
         assertEquals("60+", DanmakuBadge.format(63))
-        assertEquals("70+", DanmakuBadge.format(78))
         assertEquals("90+", DanmakuBadge.format(99))
     }
 

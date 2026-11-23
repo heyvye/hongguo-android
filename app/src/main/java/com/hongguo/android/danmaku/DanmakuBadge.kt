@@ -4,14 +4,14 @@ package com.hongguo.android.danmaku
 import java.util.Locale
 
 /**
- * 高赞弹幕的点赞数展示规则：50 起显示，并分档压缩，避免长数字占满屏幕。
+ * 高赞弹幕的点赞数展示规则：20 起显示，并分档压缩，避免长数字占满屏幕。
  *
- * 50~99 显示 `50+`；100~999 向下取整到百位加号（456 → `400+`）；
+ * 20~99 向下取整到十位加号（27 → `20+`）；100~999 向下取整到百位加号（456 → `400+`）；
  * 1000 以上用 K（3485 → `3.5K`）；10000 以上用 W（12333 → `1.2W`）。
  */
 internal object DanmakuBadge {
     /** 展示门槛：低于这个数不显示。 */
-    const val MIN_COUNT = 50
+    const val MIN_COUNT = 20
 
     fun show(count: Int): Boolean = count >= MIN_COUNT
 
